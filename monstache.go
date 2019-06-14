@@ -10,20 +10,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/evanphx/json-patch"
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
-	"golang.org/x/net/context"
-	"gopkg.in/Graylog2/go-gelf.v2/gelf"
-	"gopkg.in/natefinch/lumberjack.v2"
-	elastic "gopkg.in/olivere/elastic.v5"
-	"gopkg.in/rwynn/monstache.v3/monstachemap"
 	"io"
 	"io/ioutil"
 	"log"
@@ -40,6 +26,21 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/coreos/go-systemd/daemon"
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
+	"github.com/robertkrimen/otto"
+	_ "github.com/robertkrimen/otto/underscore"
+	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/consistent"
+	"golang.org/x/net/context"
+	"gopkg.in/Graylog2/go-gelf.v2/gelf"
+	"gopkg.in/natefinch/lumberjack.v2"
+	elastic "gopkg.in/olivere/elastic.v5"
+	"gopkg.in/rwynn/monstache.v3/monstachemap"
 )
 
 var infoLog = log.New(os.Stdout, "INFO ", log.Flags())
@@ -144,6 +145,8 @@ type indexingMeta struct {
 type mongoDialSettings struct {
 	Timeout int
 	Ssl     bool
+	// Changes: 支持 direct 参数，仅可以通过 `mongo-url` 以 query string 的形式传递
+	Direct bool
 }
 
 type mongoSessionSettings struct {
@@ -165,8 +168,10 @@ type httpServerCtx struct {
 	started    time.Time
 }
 
+// Changes: 添加新的字段 MongoStorageURL
 type configOptions struct {
 	MongoURL                 string               `toml:"mongo-url"`
+	MongoStorageURL          string               `toml:"mongo-storage-url"`
 	MongoConfigURL           string               `toml:"mongo-config-url"`
 	MongoPemFile             string               `toml:"mongo-pem-file"`
 	MongoValidatePemFile     bool                 `toml:"mongo-validate-pem-file"`
@@ -1080,6 +1085,8 @@ func saveTimestamp(s *mgo.Session, ts bson.MongoTimestamp, config *configOptions
 func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.Print, "print-config", false, "Print the configuration and then exit")
 	flag.StringVar(&config.MongoURL, "mongo-url", "", "MongoDB server or router server connection URL")
+	// Changes: 添加新的配置项 mongo-storage-url
+	flag.StringVar(&config.MongoStorageURL, "mongo-storage-url", "", "Mongo server to store synchronization progress")
 	flag.StringVar(&config.MongoConfigURL, "mongo-config-url", "", "MongoDB config server connection URL")
 	flag.StringVar(&config.MongoPemFile, "mongo-pem-file", "", "Path to a PEM file for secure connections to MongoDB")
 	flag.BoolVar(&config.MongoValidatePemFile, "mongo-validate-pem-file", true, "Set to boolean false to not validate the MongoDB PEM file")
@@ -1296,6 +1303,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		}
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
+		}
+		if config.MongoStorageURL == "" {
+			config.MongoStorageURL = tomlConfig.MongoStorageURL
 		}
 		if config.MongoConfigURL == "" {
 			config.MongoConfigURL = tomlConfig.MongoConfigURL
@@ -1709,7 +1719,12 @@ func (config *configOptions) getAuthURL(inURL string) string {
 }
 
 func (config *configOptions) configureMongo(session *mgo.Session) {
-	session.SetMode(mgo.Primary, true)
+	// Changes: 如果 mongo url 的连接方式为 direct，将其 Mode 置为 mgo.Eventual
+	if config.MongoDialSettings.Direct {
+		session.SetMode(mgo.Eventual, true)
+	} else {
+		session.SetMode(mgo.Primary, true)
+	}
 	if config.MongoSessionSettings.SocketTimeout != -1 {
 		timeOut := time.Duration(config.MongoSessionSettings.SocketTimeout) * time.Second
 		session.SetSocketTimeout(timeOut)
@@ -1760,10 +1775,22 @@ func (config *configOptions) dialMongo(inURL string) (*mgo.Session, error) {
 		}
 		return session, err
 	}
-	if config.MongoDialSettings.Timeout != -1 {
-		return mgo.DialWithTimeout(inURL,
-			time.Duration(config.MongoDialSettings.Timeout)*time.Second)
+	// Changes: 解析 url 字符串为 dialInfo 结构体，方便从中获取 direct 参数来判断此 url 的连接方式是否为直连
+	dialInfo, err := mgo.ParseURL(inURL)
+	if err != nil {
+		return nil, err
 	}
+	if config.MongoDialSettings.Timeout != -1 {
+		dialInfo.Timeout = time.Duration(config.MongoDialSettings.Timeout) * time.Second
+		return mgo.DialWithInfo(dialInfo)
+	}
+	if dialInfo.Direct {
+		config.MongoDialSettings.Direct = true
+	}
+	return mgo.DialWithInfo(dialInfo)
+}
+
+func (config *configOptions) dialStorageMongo(inURL string) (*mgo.Session, error) {
 	return mgo.Dial(inURL)
 }
 
@@ -2703,6 +2730,21 @@ func main() {
 	} else {
 		infoLog.Println("Successfully connected to MongoDB")
 	}
+	var storageMongo *mgo.Session
+	if config.MongoStorageURL != "" {
+		var err error
+		storageMongo, err = config.dialStorageMongo(config.MongoStorageURL)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to connect to storage mongo using URL %s: %s", config.MongoStorageURL, err))
+		}
+		if mongoInfo, err := storageMongo.BuildInfo(); err == nil {
+			infoLog.Printf("Successfully connected to storage MongoDB version %s", mongoInfo.Version)
+		} else {
+			infoLog.Println("Successfully connected to storage MongoDB")
+		}
+	} else {
+		storageMongo = mongo.Copy()
+	}
 	defer mongo.Close()
 	config.configureMongo(mongo)
 	loadBuiltinFunctions(mongo)
@@ -2744,11 +2786,18 @@ func main() {
 			} else if config.ResumeFromTimestamp != 0 {
 				ts = bson.MongoTimestamp(config.ResumeFromTimestamp)
 			} else {
-				collection := session.DB("monstache").C("monstache")
+				collection := storageMongo.DB("monstache").C("monstache")
 				doc := make(map[string]interface{})
 				collection.FindId(config.ResumeName).One(doc)
 				if doc["ts"] != nil {
 					ts = doc["ts"].(bson.MongoTimestamp)
+				}
+				// Changes: 如果从数据库中能查找到 ts，不做全量同步，在这里覆盖掉全量同步的参数
+				if ts != bson.MongoTimestamp(0) {
+					config.DirectReadNs = stringargs{}
+					infoLog.Println("Disabled Full synchronization for collections")
+				} else {
+					infoLog.Println("Enabled Full synchronization for collections")
 				}
 			}
 			return ts
@@ -2955,7 +3004,7 @@ func main() {
 		case <-timestampTicker.C:
 			if lastTimestamp > lastSavedTimestamp {
 				bulk.Flush()
-				if saveTimestamp(mongo, lastTimestamp, config); err == nil {
+				if saveTimestamp(storageMongo, lastTimestamp, config); err == nil {
 					lastSavedTimestamp = lastTimestamp
 				} else {
 					gtmCtx.ErrC <- err

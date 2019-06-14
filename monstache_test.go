@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
 	"github.com/rwynn/gtm"
 	"golang.org/x/net/context"
 	elastic "gopkg.in/olivere/elastic.v5"
@@ -44,7 +45,10 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+var resumeName = getEnv("RESUME_NAME", "default")
+
 var mongoUrl = getEnv("MONGO_DB_URL", "localhost:27017")
+var mongoStorageUrl = getEnv("MONGO_DB_STORAGE_URL", "")
 
 var elasticUrl = getEnv("ELASTIC_SEARCH_URL", "http://localhost:9200")
 var elasticUser = getEnv("ELASTIC_SEARCH_USER", "")
@@ -55,7 +59,7 @@ var elasticNoSniffConfig = elastic.SetSniff(false)
 var elasticUserConfig = elastic.SetBasicAuth(elasticUser, elasticPass)
 
 func init() {
-	fmt.Printf("MongoDB Url: %v\nElasticsearch Url: %v\nElasticsearch User:%v\nElasticsearch Pass:%v\n", mongoUrl, elasticUrl, elasticUser, elasticPass)
+	fmt.Printf("resumeName: %v\nMongoDB Url: %v\nStorage MongoDB Url: %v\nElasticsearch Url: %v\nElasticsearch User:%v\nElasticsearch Pass:%v\n", resumeName, mongoUrl, mongoStorageUrl, elasticUrl, elasticUser, elasticPass)
 	flag.IntVar(&delay, "delay", 3, "Delay between operations in seconds")
 	flag.Parse()
 }
@@ -64,6 +68,30 @@ func DropTestDB(t *testing.T, session *mgo.Session) {
 	db := session.DB("test")
 	if err := db.DropDatabase(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func PrintCurrentProgress(t *testing.T, session *mgo.Session) {
+	var storageSession *mgo.Session
+	if mongoStorageUrl != "" {
+		var err error
+		storageSession, err = mgo.Dial(mongoStorageUrl)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		storageSession = session.Copy()
+	}
+	defer storageSession.Close()
+	monstacheDoc := make(map[string]interface{})
+	err := storageSession.DB("monstache").C("monstache").FindId(resumeName).One(&monstacheDoc)
+	if err != nil && err.Error() != "not found" {
+		t.Fatal(err)
+	}
+	if monstacheDoc["ts"] != nil {
+		fmt.Printf("current progress tiemstamp %v\n", monstacheDoc["ts"].(bson.MongoTimestamp).Time())
+	} else {
+		fmt.Printf("current progress tiemstamp is null\n")
 	}
 }
 
@@ -223,6 +251,7 @@ func TestInsert(t *testing.T) {
 		time.Sleep(time.Duration(delay) * time.Second)
 		if resp, err := client.Get().Index("test.test").Type("test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
+			PrintCurrentProgress(t, session)
 		} else {
 			t.Fatal(err)
 		}
@@ -250,6 +279,7 @@ func TestUpdate(t *testing.T) {
 		time.Sleep(time.Duration(delay) * time.Second)
 		if resp, err := client.Get().Index("test.test").Type("test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
+			PrintCurrentProgress(t, session)
 		} else {
 			t.Fatal(err)
 		}
@@ -287,6 +317,7 @@ func TestDelete(t *testing.T) {
 		time.Sleep(time.Duration(delay) * time.Second)
 		if resp, err := client.Get().Index("test.test").Type("test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
+			PrintCurrentProgress(t, session)
 		} else {
 			t.Fatal(err)
 		}
@@ -322,6 +353,7 @@ func TestDropDatabase(t *testing.T) {
 		time.Sleep(time.Duration(delay) * time.Second)
 		if resp, err := client.Get().Index("test.test").Type("test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
+			PrintCurrentProgress(t, session)
 		} else {
 			t.Fatal(err)
 		}
@@ -337,6 +369,7 @@ func TestDropDatabase(t *testing.T) {
 		if exists {
 			t.Fatal("clientsearch index not deleted")
 		}
+		PrintCurrentProgress(t, session)
 	} else {
 		t.Fatal(err)
 	}
@@ -361,6 +394,7 @@ func TestDropCollection(t *testing.T) {
 		time.Sleep(time.Duration(delay) * time.Second)
 		if resp, err := client.Get().Index("test.test").Type("test").Id("1").Do(context.Background()); err == nil {
 			ValidateDocResponse(t, doc, resp)
+			PrintCurrentProgress(t, session)
 		} else {
 			t.Fatal(err)
 		}
@@ -375,6 +409,7 @@ func TestDropCollection(t *testing.T) {
 		if exists {
 			t.Fatal("clientsearch index not deleted")
 		}
+		PrintCurrentProgress(t, session)
 	} else {
 		t.Fatal(err)
 	}

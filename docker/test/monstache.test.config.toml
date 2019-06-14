@@ -20,6 +20,7 @@ gzip = false
 # connect to MongoDB using the following URL
 # mongo-url = "mongodb://mongo-0:27017"
 mongo-url = "mongodb://root-user:password@mongo-0:27017"
+mongo-storage-url = "mongodb://root-user-1:password@mongo-1:27017"
 
 # # use the following PEM file for connections to MongoDB
 # mongo-pem-file = "/path/to/mongoCert.pem"
@@ -61,7 +62,7 @@ elasticsearch-max-docs = 1
 
 # # # resume processing from a timestamp saved in a previous run
 # # TODO double check
-# resume = true
+resume = true
 # # # do not validate that progress timestamps have been saved
 # resume-write-unsafe = true
 # # # override the name under which resume state is saved
