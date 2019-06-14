@@ -10,22 +10,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/evanphx/json-patch"
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
-	"github.com/smartystreets/go-aws-auth"
-	"golang.org/x/net/context"
-	"gopkg.in/Graylog2/go-gelf.v2/gelf"
-	"gopkg.in/natefinch/lumberjack.v2"
-	elastic "gopkg.in/olivere/elastic.v5"
-	"gopkg.in/olivere/elastic.v5/aws"
-	"gopkg.in/rwynn/monstache.v3/monstachemap"
 	"io"
 	"io/ioutil"
 	"log"
@@ -43,6 +27,23 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/coreos/go-systemd/daemon"
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
+	"github.com/robertkrimen/otto"
+	_ "github.com/robertkrimen/otto/underscore"
+	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/consistent"
+	awsauth "github.com/smartystreets/go-aws-auth"
+	"golang.org/x/net/context"
+	"gopkg.in/Graylog2/go-gelf.v2/gelf"
+	"gopkg.in/natefinch/lumberjack.v2"
+	elastic "gopkg.in/olivere/elastic.v5"
+	"gopkg.in/olivere/elastic.v5/aws"
+	"gopkg.in/rwynn/monstache.v3/monstachemap"
 )
 
 var infoLog = log.New(os.Stdout, "INFO ", log.Flags())
@@ -70,6 +71,9 @@ var chunksRegex = regexp.MustCompile("\\.chunks$")
 var systemsRegex = regexp.MustCompile("system\\..+$")
 var exitStatus = 0
 var mongoDialInfo *mgo.DialInfo
+var mongoVersion string
+var defaultOpLogDatabaseName = "local"
+var defaultOpLogCollectionName = "oplog.rs"
 
 const version = "3.24.4"
 const mongoURLDefault string = "localhost"
@@ -221,6 +225,7 @@ type configOptions struct {
 	EnableTemplate           bool
 	EnvDelimiter             string
 	MongoURL                 string               `toml:"mongo-url"`
+	MongoStorageURL          string               `toml:"mongo-storage-url"`
 	MongoConfigURL           string               `toml:"mongo-config-url"`
 	MongoPemFile             string               `toml:"mongo-pem-file"`
 	MongoValidatePemFile     bool                 `toml:"mongo-validate-pem-file"`
@@ -390,6 +395,10 @@ func afterBulk(executionId int64, requests []elastic.BulkableRequest, response *
 		failed := response.Failed()
 		if failed != nil {
 			for _, item := range failed {
+				// 状态为 409 表示版本冲突，bulk 操作可能导致新的记录提前于旧的插入，这属于正常现象，故跳过记录日志
+				if item.Status == 409 {
+					continue
+				}
 				json, err := json.Marshal(item)
 				if err != nil {
 					errorLog.Printf("Unable to marshal bulk response item: %s", err)
@@ -1386,6 +1395,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.EnableTemplate, "tpl", false, "True to interpret the config file as a template")
 	flag.StringVar(&config.EnvDelimiter, "env-delimiter", ",", "A delimiter to use when splitting environment variable values")
 	flag.StringVar(&config.MongoURL, "mongo-url", "", "MongoDB server or router server connection URL")
+	flag.StringVar(&config.MongoStorageURL, "mongo-storage-url", "", "MongoDB storage server connection URL")
 	flag.StringVar(&config.MongoConfigURL, "mongo-config-url", "", "MongoDB config server connection URL")
 	flag.StringVar(&config.MongoPemFile, "mongo-pem-file", "", "Path to a PEM file for secure connections to MongoDB")
 	flag.BoolVar(&config.MongoValidatePemFile, "mongo-validate-pem-file", true, "Set to boolean false to not validate the MongoDB PEM file")
@@ -1743,6 +1753,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		if config.MongoURL == "" {
 			config.MongoURL = tomlConfig.MongoURL
 		}
+		if config.MongoStorageURL == "" {
+			config.MongoStorageURL = tomlConfig.MongoStorageURL
+		}
 		if config.MongoConfigURL == "" {
 			config.MongoConfigURL = tomlConfig.MongoConfigURL
 		}
@@ -2071,6 +2084,11 @@ func (config *configOptions) loadEnvironment() *configOptions {
 		case "MONSTACHE_MONGO_URL":
 			if config.MongoURL == "" {
 				config.MongoURL = val
+			}
+			break
+		case "MONSTACHE_MONGO_STORAGE_URL":
+			if config.MongoStorageURL == "" {
+				config.MongoStorageURL = val
 			}
 			break
 		case "MONSTACHE_MONGO_CONFIG_URL":
@@ -2566,6 +2584,9 @@ func (config *configOptions) dialMongo(inURL string) (*mgo.Session, error) {
 		go config.timeoutConnection(inURL, mongoOk)
 	}
 	session, err := mgo.DialWithInfo(dialInfo)
+	if dialInfo.Direct == true {
+		session.SetMode(mgo.Eventual, true)
+	}
 	close(mongoOk)
 	if err == nil {
 		session.SetSyncTimeout(time.Duration(config.MongoSessionSettings.SyncTimeout) * time.Second)
@@ -2577,6 +2598,10 @@ func (config *configOptions) dialMongo(inURL string) (*mgo.Session, error) {
 		}
 	}
 	return session, err
+}
+
+func (config *configOptions) dialStorageMongo(inURL string) (*mgo.Session, error) {
+	return mgo.Dial(inURL)
 }
 
 func (config *configOptions) NewHTTPClient() (client *http.Client, err error) {
@@ -3800,18 +3825,52 @@ func handlePanic() {
 	}
 }
 
-func saveTimestampFromReplStatus(session *mgo.Session, config *configOptions) {
-	if rs, err := gtm.GetReplStatus(session); err == nil {
-		var ts bson.MongoTimestamp
-		if ts, err = rs.GetLastCommitted(); err == nil {
-			if err = saveTimestamp(session, ts, config); err != nil {
+func saveTimestampFromReplStatus(session, storageMongo *mgo.Session, config *configOptions, gtmOpts *gtm.Options) {
+	// mongo 3.2 的 replSetGetStatus command 不包含 lastCommittedOpTime 字段
+	// 改用 LastOpTimestamp 代替
+	if strings.Contains(mongoVersion, "3.2") {
+		ts := gtm.LastOpTimestamp(session, gtmOpts)
+		if ts != bson.MongoTimestamp(0) {
+			if err := saveTimestamp(storageMongo, ts, config); err != nil {
+				processErr(err, config)
+			}
+		}
+	} else {
+		if rs, err := gtm.GetReplStatus(session); err == nil {
+			var ts bson.MongoTimestamp
+			if ts, err = rs.GetLastCommitted(); err == nil {
+				if err = saveTimestamp(storageMongo, ts, config); err != nil {
+					processErr(err, config)
+				}
+			} else {
 				processErr(err, config)
 			}
 		} else {
 			processErr(err, config)
 		}
+	}
+}
+
+func checkDirectRead(mongo, storageMongo *mgo.Session, config *configOptions, gtmOpts *gtm.Options) {
+	firstOpTimestamp := gtm.FirstOpTimestamp(mongo, gtmOpts)
+	lastOpTimestamp := gtm.LastOpTimestamp(mongo, gtmOpts)
+	var ts bson.MongoTimestamp
+	collection := storageMongo.DB(config.ConfigDatabaseName).C("monstache")
+	doc := make(map[string]interface{})
+	collection.FindId(config.ResumeName).One(doc)
+	if doc["ts"] != nil {
+		ts = doc["ts"].(bson.MongoTimestamp)
+		// 如果从数据库中能查找到 ts，并且 ts 在 oplog 的区间内，不做全量同步，在这里覆盖掉全量同步的参数
+		if ts >= firstOpTimestamp && ts <= lastOpTimestamp {
+			config.DirectReadNs = stringargs{}
+			gtmOpts.DirectReadNs = config.DirectReadNs
+			infoLog.Println("Disabled Direct Read for collections due to resume timestamp in the normal oplog range")
+		} else {
+			infoLog.Println("Enabled Direct Read for collections due to resume timestamp out of oplog range")
+		}
+		infoLog.Printf("resumeOpTimestamp: %v, firstOpTimestamp: %v, lastOpTimestamp: %v", ts.Time(), firstOpTimestamp.Time(), lastOpTimestamp.Time())
 	} else {
-		processErr(err, config)
+		infoLog.Println("Enabled Direct Read for collections due to missing resume timestamp")
 	}
 }
 
@@ -3853,10 +3912,27 @@ func main() {
 	infoLog.Printf("Started monstache version %s", version)
 	if mongoInfo, err := mongo.BuildInfo(); err == nil {
 		infoLog.Printf("Successfully connected to MongoDB version %s", mongoInfo.Version)
+		mongoVersion = mongoInfo.Version
 	} else {
 		infoLog.Println("Successfully connected to MongoDB")
 	}
 	defer mongo.Close()
+	var storageMongo *mgo.Session
+	if config.MongoStorageURL != "" {
+		var err error
+		storageMongo, err = config.dialStorageMongo(config.MongoStorageURL)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to connect to storage mongo using URL %s: %s", config.MongoStorageURL, err))
+		}
+		if mongoInfo, err := storageMongo.BuildInfo(); err == nil {
+			infoLog.Printf("Successfully connected to storage MongoDB version %s", mongoInfo.Version)
+		} else {
+			infoLog.Println("Successfully connected to storage MongoDB")
+		}
+	} else {
+		storageMongo = mongo.Copy()
+	}
+	defer storageMongo.Close()
 	loadBuiltinFunctions(mongo, config)
 
 	elasticClient, err := config.newElasticClient()
@@ -3899,7 +3975,7 @@ func main() {
 	go func() {
 		<-sigs
 		if enabled {
-			shutdown(10, hsc, bulk, bulkStats, mongo, config)
+			shutdown(10, hsc, bulk, bulkStats, storageMongo, config)
 		} else {
 			shutdown(10, hsc, nil, nil, nil, config)
 		}
@@ -3917,7 +3993,7 @@ func main() {
 	} else if config.Resume {
 		after = func(session *mgo.Session, options *gtm.Options) bson.MongoTimestamp {
 			var ts bson.MongoTimestamp
-			collection := session.DB(config.ConfigDatabaseName).C("monstache")
+			collection := storageMongo.DB(config.ConfigDatabaseName).C("monstache")
 			doc := make(map[string]interface{})
 			collection.FindId(config.ResumeName).One(doc)
 			if doc["ts"] != nil {
@@ -3925,6 +4001,7 @@ func main() {
 			} else {
 				ts = gtm.LastOpTimestamp(session, options)
 			}
+			infoLog.Printf("Tailing op logs from %v", ts.Time())
 			return ts
 		}
 	}
@@ -3983,17 +4060,21 @@ func main() {
 	var oplogDatabaseName, oplogCollectionName *string
 	if config.MongoOpLogDatabaseName != "" {
 		oplogDatabaseName = &config.MongoOpLogDatabaseName
+	} else {
+		oplogDatabaseName = &defaultOpLogDatabaseName
 	}
 	if config.MongoOpLogCollectionName != "" {
 		oplogCollectionName = &config.MongoOpLogCollectionName
+	} else {
+		oplogCollectionName = &defaultOpLogCollectionName
 	}
 	if config.ClusterName != "" {
-		if err = ensureClusterTTL(mongo, config); err == nil {
+		if err = ensureClusterTTL(storageMongo, config); err == nil {
 			infoLog.Printf("Joined cluster %s", config.ClusterName)
 		} else {
 			panic(fmt.Sprintf("Unable to enable cluster mode: %s", err))
 		}
-		enabled, err = enableProcess(mongo, config)
+		enabled, err = enableProcess(storageMongo, config)
 		if err != nil {
 			panic(fmt.Sprintf("Unable to determine enabled cluster process: %s", err))
 		}
@@ -4057,6 +4138,10 @@ func main() {
 		ChangeStreamNs:      changeStreamNs,
 	}
 
+	if config.Resume {
+		checkDirectRead(mongo, storageMongo, config, gtmOpts)
+	}
+
 	heartBeat := time.NewTicker(10 * time.Second)
 	if config.ClusterName != "" {
 		if enabled {
@@ -4065,7 +4150,7 @@ func main() {
 			infoLog.Printf("Pausing work for cluster %s", config.ClusterName)
 			bulk.Stop()
 			for range heartBeat.C {
-				enabled, err = enableProcess(mongo, config)
+				enabled, err = enableProcess(storageMongo, config)
 				if enabled {
 					infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
 					bulk.Start(context.Background())
@@ -4162,7 +4247,7 @@ func main() {
 			gtmCtx.DirectReadWg.Wait()
 			infoLog.Println("Direct reads completed")
 			if config.Resume {
-				saveTimestampFromReplStatus(mongo, config)
+				saveTimestampFromReplStatus(mongo, storageMongo, config, gtmOpts)
 			}
 			if config.ExitAfterDirectReads {
 				gtmCtx.Stop()
@@ -4185,7 +4270,7 @@ func main() {
 		case timeout := <-doneC:
 			if enabled {
 				enabled = false
-				shutdown(timeout, hsc, bulk, bulkStats, mongo, config)
+				shutdown(timeout, hsc, bulk, bulkStats, storageMongo, config)
 			} else {
 				shutdown(timeout, hsc, nil, nil, nil, config)
 			}
@@ -4196,7 +4281,7 @@ func main() {
 			}
 			if lastTimestamp > lastSavedTimestamp {
 				bulk.Flush()
-				if saveTimestamp(mongo, lastTimestamp, config); err == nil {
+				if saveTimestamp(storageMongo, lastTimestamp, config); err == nil {
 					lastSavedTimestamp = lastTimestamp
 				} else {
 					processErr(err, config)
@@ -4207,27 +4292,27 @@ func main() {
 				break
 			}
 			if enabled {
-				enabled, err = ensureEnabled(mongo, config)
+				enabled, err = ensureEnabled(storageMongo, config)
 				if !enabled {
 					infoLog.Printf("Pausing work for cluster %s", config.ClusterName)
 					gtmCtx.Pause()
 					bulk.Stop()
 					for range heartBeat.C {
-						enabled, err = enableProcess(mongo, config)
+						enabled, err = enableProcess(storageMongo, config)
 						if enabled {
 							infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
 							bulk.Start(context.Background())
-							resumeWork(gtmCtx, mongo, config)
+							resumeWork(gtmCtx, storageMongo, config)
 							break
 						}
 					}
 				}
 			} else {
-				enabled, err = enableProcess(mongo, config)
+				enabled, err = enableProcess(storageMongo, config)
 				if enabled {
 					infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
 					bulk.Start(context.Background())
-					resumeWork(gtmCtx, mongo, config)
+					resumeWork(gtmCtx, storageMongo, config)
 				}
 			}
 			if err != nil {

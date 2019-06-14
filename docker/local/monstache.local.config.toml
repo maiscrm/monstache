@@ -1,0 +1,20 @@
+gzip = false
+mongo-url = "mongodb://root-user:password@127.0.0.1:27017"
+# mongo-url = "mongodb://root-user:password@127.0.0.1:27017/?connect=direct"
+mongo-storage-url = "mongodb://root-user-1:password@127.0.0.1:27018"
+elasticsearch-urls = ["http://127.0.0.1:9200"]
+elasticsearch-user = "elastic"
+elasticsearch-password = "changeme"
+elasticsearch-max-conns = 10
+resume = true
+namespace-regex = '^portal\.(user|\$cmd)$'
+worker = "dev-portal-user-1"
+workers = ["dev-portal-user-1"]
+verbose = true
+# cluster-name = 'sync-cluster'
+# enable-http-server = true
+# stats = true
+[[mapping]]
+namespace = "portal.user"
+index = "dev-portal-user"
+type = "user"
