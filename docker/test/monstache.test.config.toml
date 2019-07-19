@@ -2,6 +2,8 @@ gzip = false
 
 mongo-url = "mongodb://root-user:password@mongo-0:27017"
 
+mongo-storage-url = "mongodb://root-user-1:password@mongo-1:27017"
+
 elasticsearch-urls = ["http://es5:9200"]
 
 elasticsearch-user = "elastic"
@@ -13,6 +15,8 @@ elasticsearch-max-conns = 10
 elasticsearch-max-seconds = 1
 
 elasticsearch-max-docs = 1
+
+resume = true
 
 namespace-regex = '^test\.(test|\$cmd)$'
 

@@ -6,6 +6,9 @@ set -m;
 ./mongo-users-setup.sh;
 # fi
 
+# 等待 mongo-users-setup 所启动的 server 进程完全关闭
+sleep 5;
+
 mongodb_cmd="mongod"
 
 cmd="$mongodb_cmd"

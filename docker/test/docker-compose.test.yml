@@ -19,6 +19,8 @@ services:
     depends_on:
       mongo-0:
         condition: service_started
+      mongo-1:
+        condition: service_started
       es5:
         condition: service_healthy
     ports:
@@ -43,12 +45,15 @@ services:
     depends_on:
       mongo-0:
         condition: service_started
+      mongo-1:
+        condition: service_started
       es5:
         condition: service_healthy
       monstache:
         condition: service_healthy
     environment:
       MONGO_DB_URL: 'mongodb://root-user:password@mongo-0:27017'
+      MONGO_DB_STORAGE_URL: 'mongodb://root-user-1:password@mongo-1:27017'
       ELASTIC_SEARCH_USER: 'elastic'
       ELASTIC_SEARCH_PASS: 'changeme'
       ELASTIC_SEARCH_URL: 'http://es5:9200'
@@ -56,10 +61,10 @@ services:
       - test
 
   mongo-0:
-    image: mongo:3.4.14-jessie
+    image: mongo:3.2.19-jessie
     logging:
       driver: none
-    container_name: c-mongo
+    container_name: c-mongo-0
     command: /scripts/mongo-run.sh
     working_dir: /scripts
     volumes:
@@ -83,6 +88,34 @@ services:
       # MONGO_USER_BACKUP_PASSWORD: password
     ports:
       - "27017:27017"
+    networks:
+      - test
+    healthcheck:
+      test: "[ -f /data/health.check ] && exit 0 || exit 1"
+      interval: 1s
+      timeout: 30s
+      retries: 300
+    restart: unless-stopped
+
+  mongo-1:
+    image: mongo:3.2.19-jessie
+    logging:
+      driver: none
+    container_name: c-mongo-1
+    command: /scripts/mongo-run.sh
+    working_dir: /scripts
+    volumes:
+      - ./mongodb/scripts:/scripts
+    environment:
+      MONGO_REPLICA_SET_NAME: rs1
+      MONGO_REPLICAS: mongo-1:27017
+      MONGO_REPLICA_SET_MEMBERS: "[{'_id':0,'host':'mongo-1:27017','priority':1}]"
+      MONGO_USER_ROOT_NAME: root-user-1
+      MONGO_USER_ROOT_PASSWORD: password
+      MONGO_AUTH_SOURCE: admin
+      MONGO_BIND_IP: "0.0.0.0"
+    ports:
+      - "27018:27017"
     networks:
       - test
     healthcheck:
